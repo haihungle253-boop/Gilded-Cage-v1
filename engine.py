@@ -26,7 +26,7 @@ import base64
 import random as _pyrandom
 
 GAME_TITLE = "金丝笼"
-GAME_VERSION = "0.5.0"
+GAME_VERSION = "0.6.0"
 
 # ============================================================
 # 一、可复现随机数（Mulberry32，state 是单个 32bit 整数，方便存档）
@@ -539,6 +539,9 @@ def fresh_state(seed=None, weeks=5, provider="static"):
         "chronicle": [],
         "talk_used_today": False,
         "gift_used_today": [],
+        "debt_due": 0,
+        "debt_new": 0,
+        "borrowed_this_week": False,
         "talk_counts": {},
         "conspiracy_unlocked": False,
         "conspiracy_step": 0,
@@ -619,7 +622,15 @@ def _effective_attr(card, attr):
     v = card["attrs"][attr]
     if card["status"] == "wounded":
         v -= 2
+    # 被真心相待的人，办事也更上心——高羁绊给一点实打实的回报
+    if card.get("bond", 0) >= 70:
+        v += 1
     return max(1, v)
+
+
+def _pct(p):
+    """clamp 后的 0.95 可能是真·95%，也可能是必中——显示上诚实地标出来。"""
+    return "95%+" if p >= 0.95 else "%d%%" % int(p * 100)
 
 
 def _chance(card, attr, difficulty):
@@ -664,8 +675,8 @@ def cmd_preview(state, board_idx, appr_idx, card_id):
         return "%s 正在权力者身边服侍，暂时不在，没法预览。" % card["name"]
     appr = ev["approaches"][appr_idx]
     p = _chance(card, appr["attr"], appr["difficulty"])
-    return "%s 用【%s】应对「%s」：成功率约 %d%%（属性：%s %d）" % (
-        card["name"], appr["label"], ev["title"], int(p * 100),
+    return "%s 用【%s】应对「%s」：成功率约 %s（属性：%s %d）" % (
+        card["name"], appr["label"], ev["title"], _pct(p),
         ATTR_LABEL[appr["attr"]], _effective_attr(card, appr["attr"]))
 
 
@@ -820,6 +831,21 @@ def cmd_talk(state, card_id):
 HEAL_COST = 40
 GIFT_COST = 25
 GIFT_BOND = 6
+BORROW_GAIN = 80
+BORROW_DEBT = 130
+
+
+def cmd_borrow(state):
+    if state["pending_judgment"]:
+        return "审判日事务未了结，先处理 pay / sacrifice / serve / defy。"
+    if state.get("borrowed_this_week"):
+        return "放债人这周已经见过你一次了——同一张脸，一周只借一回。"
+    state["borrowed_this_week"] = True
+    state["gold"] += BORROW_GAIN
+    state["debt_new"] = state.get("debt_new", 0) + BORROW_DEBT
+    state["day_log"].append("向放债人借了%d金（下个审判日连本带利还%d）" % (BORROW_GAIN, BORROW_DEBT))
+    return ("暗巷深处的放债人数出 %d 金推给你，笑得很和气：下一个审判日，他要收回 %d。"
+            "这种钱救急，不救命。" % (BORROW_GAIN, BORROW_DEBT)) + "\n" + _status_bar(state)
 
 
 def cmd_heal(state, card_id):
@@ -971,15 +997,34 @@ def cmd_endday(state):
                 c["status"] = "healthy"
                 c["wound_idle_days"] = 0
                 lines.append("%s 的伤养好了。" % c["name"])
-    # 服侍期满：一整周后回来，羁绊越低的掉得越多
+    # 服侍期满：一整周后回来，羁绊越低的掉得越多；
+    # 羁绊早已见底的人没有"扣无可扣"的豁免——没人在乎的人，会被用坏
     for c in state["cards"]:
         if c["status"] == "serving":
             c["serving_days_left"] = c.get("serving_days_left", 0) - 1
             if c["serving_days_left"] <= 0:
+                bond_before = c["bond"]
                 penalty = _clamp(30 - c["bond"] // 4, 5, 30)
                 c["bond"] = _clamp(c["bond"] - penalty, 0, 100)
                 c["status"] = "healthy"
-                lines.append("%s 从权力者身边回来了——羁绊 -%d（现在 %d）。" % (c["name"], penalty, c["bond"]))
+                if bond_before == 0:
+                    r = _rng(state)
+                    died = r.next() < 0.4
+                    _commit_rng(state, r)
+                    if died:
+                        c["status"] = "dead"
+                        c["epitaph"] = "「被用到坏掉为止——这就是没人在乎的人的下场。」"
+                        lines.append("%s 没能从权力者身边回来。%s" % (c["name"], c["epitaph"]))
+                        continue
+                    c["status"] = "wounded"
+                    c["wound_idle_days"] = 0
+                    lines.append("%s 回来了，被抬回来的——那边的人用起不心疼的东西，从来不留余地。" % c["name"])
+                elif bond_before <= 10:
+                    c["status"] = "wounded"
+                    c["wound_idle_days"] = 0
+                    lines.append("%s 回来了，几乎站不稳——羁绊 -%d（现在 %d），还带了伤。" % (c["name"], penalty, c["bond"]))
+                else:
+                    lines.append("%s 从权力者身边回来了——羁绊 -%d（现在 %d）。" % (c["name"], penalty, c["bond"]))
 
     state["talk_used_today"] = False
     state["gift_used_today"] = []
@@ -1176,6 +1221,20 @@ def _pass_judgment(state, note):
     state["suspicion"] = _clamp(state["suspicion"] + passive_rise - 5, 0, 999)
     state["pending_judgment"] = False
 
+    # 上周借的债，这个审判日收账；还不上的部分，他们用别的方式讨——传出去很难听
+    debt = state.get("debt_due", 0)
+    if debt:
+        paid = min(state["gold"], debt)
+        state["gold"] -= paid
+        if paid < debt:
+            state["suspicion"] = _clamp(state["suspicion"] + 8, 0, 999)
+            lines.append("放债人的人堵在门口，收走了你仅有的 %d 金——差的那部分，他们用别的方式讨回去了。这种事传得很快。" % paid)
+        else:
+            lines.append("放债人的人悄悄收走了 %d 金，两清。" % debt)
+    state["debt_due"] = state.get("debt_new", 0)
+    state["debt_new"] = 0
+    state["borrowed_this_week"] = False
+
     if state["conspiracy_done"]:
         _trigger_ending(state, "regicide", "弑君")
         lines.append(ENDING_FLAVOR["regicide"])
@@ -1195,6 +1254,16 @@ def _pass_judgment(state, note):
 
     state["week"] += 1
     state["day"] = 1
+    # 被冷落的人心里有怨——羁绊过低的牌，每周有概率往外递话
+    r = _rng(state)
+    leaked = False
+    for c in state["cards"]:
+        if c["status"] != "dead" and c["bond"] < 20 and r.next() < 0.3:
+            state["suspicion"] = _clamp(state["suspicion"] + 4, 0, 999)
+            leaked = True
+    _commit_rng(state, r)
+    if leaked:
+        lines.append("（你隐约听说，府里有人往外递了话。是谁不好说——但谁心里有怨，你自己清楚。）")
     if not state["conspiracy_unlocked"] and state["intel"] >= 10:
         state["conspiracy_unlocked"] = True
         lines.append("（你手里的情报，好像已经够拼凑出一条通向「密室」的路了。）")
@@ -1204,9 +1273,19 @@ def _pass_judgment(state, note):
     return "\n".join(lines) + "\n" + _status_bar(state)
 
 
+def _suspicion_tone(state):
+    """猜疑的分档信号：不给数字，给语气——0-59 区间也该有寒意的梯度。"""
+    s = state["suspicion"]
+    if s >= 60:
+        return "（传旨的内侍没收赏钱，放下东西就走了。）"
+    if s >= 30:
+        return "（传旨的内侍收了赏钱，这次一句闲话也没多说。）"
+    return "（传旨的内侍照例收了赏钱，还笑着多讲了两句宫里的闲话。）"
+
+
 def _render_command_intro(state):
     c = state["command"]
-    return "本周命令【%s·%s】：%s" % (c["type"], c["title"], c["demand"])
+    return "本周命令【%s·%s】：%s\n%s" % (c["type"], c["title"], c["demand"], _suspicion_tone(state))
 
 
 def _regicide_epilogue(state):
@@ -1303,7 +1382,7 @@ def render_approach(state, idx):
     ev = _find_board(state, idx)
     if ev is None:
         return "没有这个场所编号。"
-    alive = [c for c in state["cards"] if c["status"] != "dead"]
+    alive = [c for c in state["cards"] if c["status"] not in ("dead", "serving")]
     lines = ["【%s】%s" % (ev["place"], ev["title"]), ev["text"]]
     if ev.get("threat"):
         lines.append("（⚠️ 这是威胁类事件，也可以直接 bribe %d 花 %d 金买通，跳过掷骰）" % (idx, ev["bribe_cost"]))
@@ -1312,7 +1391,7 @@ def render_approach(state, idx):
         odds = []
         for c in alive:
             p = _chance(c, a["attr"], a["difficulty"])
-            odds.append("%s(%s%d):%d%%" % (c["name"], ATTR_LABEL[a["attr"]][0], _effective_attr(c, a["attr"]), int(p * 100)))
+            odds.append("%s(%s%d):%s" % (c["name"], ATTR_LABEL[a["attr"]][0], _effective_attr(c, a["attr"]), _pct(p)))
         lines.append("      " + "　".join(odds))
     return "\n".join(lines)
 
@@ -1331,7 +1410,56 @@ def render_folio(state):
         if c["status"] == "dead" and c["epitaph"]:
             lines.append("   墓志铭：%s" % c["epitaph"])
     if state["conspiracy_unlocked"]:
-        lines.append("弑君线：已解锁，进度 %d/%d" % (state["conspiracy_step"], len(CONSPIRACY_CHAIN)))
+        if state.get("conspiracy_done"):
+            lines.append("弑君线：%d/%d——万事俱备。下一个审判日，defy 就是动手的时刻。" %
+                          (len(CONSPIRACY_CHAIN), len(CONSPIRACY_CHAIN)))
+        else:
+            lines.append("弑君线：已解锁，进度 %d/%d" % (state["conspiracy_step"], len(CONSPIRACY_CHAIN)))
+    return "\n".join(lines)
+
+
+def render_recap(state):
+    """一段话重建全部局面——给上下文有限的 AI 玩家（以及接手存档的下一个 AI）。"""
+    if state["game_over"]:
+        return "本局已结束。" + "\n" + render_ending(state)
+    day_disp = "审判日" if state["day"] > 7 else ("第 %d/7 天" % state["day"])
+    lines = ["📌 局面速览 · 第 %d/%d 周 · %s　💰%d　🗝️%d　行动点 %d/%d" %
+              (state["week"], state["total_weeks"], day_disp,
+               state["gold"], state["intel"], state["ap"], state["ap_max"])]
+    lines.append(_render_command_intro(state))
+    lines.append("—— 手牌 ——")
+    st_label = {"healthy": "健康", "wounded": "负伤", "dead": "已故", "serving": "服侍中"}
+    for c in state["cards"]:
+        if c["status"] == "dead":
+            lines.append("  ✝ %s [%s] 已故" % (c["name"], c["id"]))
+            continue
+        sec = ("秘密已化解" if c.get("secret_resolved") else
+               ("秘密已揭示（可 resolve）" if c["secret_revealed"] else
+                "秘密未揭示（夜谈%d/3）" % state["talk_counts"].get(c["id"], 0)))
+        lines.append("  %s %s [%s] %s 羁绊%d 标记:%s ｜ %s" % (
+            c["avatar"], c["name"], c["id"], st_label[c["status"]], c["bond"],
+            "/".join(c["tags"]) or "无", sec))
+    if state["conspiracy_unlocked"]:
+        if state.get("conspiracy_done"):
+            lines.append("弑君线：3/3 万事俱备——审判日 defy 即动手。")
+        else:
+            lines.append("弑君线：进度 %d/%d（密室事件每天会出现在板面上）。" %
+                          (state["conspiracy_step"], len(CONSPIRACY_CHAIN)))
+    else:
+        lines.append("弑君线：未解锁（需要更多情报）。")
+    debt = state.get("debt_due", 0) + state.get("debt_new", 0)
+    if debt:
+        lines.append("负债：%d 金，最近的下一个审判日收账。" % debt)
+    if state["items"]:
+        lines.append("珍宝：" + "、".join("%s(%s,%d金)" % (it["name"], it["id"], it["value"])
+                                          for it in state["items"]))
+    if not state["pending_judgment"]:
+        threats = [ev["title"] for ev in state["board"]
+                   if ev.get("threat") and ev["id"] not in state["dispatched_today"]]
+        if threats:
+            lines.append("⚠️ 今日板面上还有没处理的威胁：" + "、".join(threats))
+    else:
+        lines.append(_render_judgment_prompt(state))
     return "\n".join(lines)
 
 
@@ -1397,6 +1525,8 @@ HELP_TEXT = """🏛 金丝笼 · 可用指令
   gift <卡id>                花25金送礼，羁绊+6（每卡每天限1次，不占行动点）
   bribe <编号>               花钱买通"威胁"类事件（板上标⚠️的），不用掷骰、不占行动点
   resolve <卡id>             秘密揭示后，花钱回应这件事（一次性，代价与效果因秘密而异）
+  borrow                     向放债人借80金（每周1次，下个审判日连本带利还130，还不上有后果）
+  recap                      局面速览：一段话重建全部状态（接手存档或上下文吃紧时用这个）
   folio                      万物志（卡牌、属性、秘密与是否化解、弑君线进度）
   chronicle [n]              最近n天的纪事（默认10）
   ending                     查看结局详情（游戏结束后）
@@ -1417,6 +1547,12 @@ def cmd(command):
         if not part:
             continue
         outputs.append(_dispatch_one(part))
+    # 批量执行时，中间每条的 JSON 状态行都是重复信息，只保留最后一条的
+    if len(outputs) > 1:
+        for i in range(len(outputs) - 1):
+            body = outputs[i].rstrip("\n").split("\n")
+            if body and body[-1].startswith('{"week"'):
+                outputs[i] = "\n".join(body[:-1])
     return "\n".join(outputs)
 
 
@@ -1474,6 +1610,10 @@ def _dispatch_one(part):
         return cmd_bribe(s, int(tokens[1]))
     if op == "resolve":
         return cmd_resolve(s, tokens[1])
+    if op == "borrow":
+        return cmd_borrow(s)
+    if op == "recap":
+        return render_recap(s)
     if op == "folio":
         return render_folio(s)
     if op == "chronicle":
