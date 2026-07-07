@@ -26,7 +26,7 @@ import base64
 import random as _pyrandom
 
 GAME_TITLE = "金丝笼"
-GAME_VERSION = "0.2.0"
+GAME_VERSION = "0.3.0"
 
 # ============================================================
 # 一、可复现随机数（Mulberry32，state 是单个 32bit 整数，方便存档）
@@ -105,6 +105,31 @@ SECRET_POOL = [
     "{ta}其实是逃亡贵族的私生{zi}，身份一旦暴露就是灭顶之灾。",
 ]
 
+# 与 SECRET_POOL 逐条对应的"化解"方案：秘密不只是 +1 情报的风味文本，
+# 揭示之后可以花钱去回应它——这是金币"花在自己人身上"最重要的一个出口。
+SECRET_RESOLUTIONS = [
+    {"cost": 70, "bond": 10, "intel": 1, "suspicion": 0,
+     "text": "你私下把这事按了下去——从今往后，再没人能靠这个要挟{ta}。密信断了。"},
+    {"cost": 55, "bond": 12, "intel": 0, "suspicion": 3,
+     "text": "你没有声张，只是把这份秘密和你自己的处境绑在了一起——从今往后，你们谁都不能倒。"},
+    {"cost": 40, "bond": 8, "intel": 1, "suspicion": 0,
+     "text": "你要来了那把钥匙，来源也终于问清楚——不过是一次顺手的偷窃，不是阴谋。你没有声张。"},
+    {"cost": 25, "bond": 9, "intel": 0, "suspicion": 0,
+     "text": "你没有告发，反而把自己藏的几本书也借给了{ta}。"},
+    {"cost": 55, "bond": 8, "intel": 0, "suspicion": -3,
+     "text": "你把这份功劳，想办法补记回了档案里——权力者未必会记得，但记录会。"},
+    {"cost": 45, "bond": 9, "intel": 0, "suspicion": 0,
+     "text": "你替{ta}把这份往来遮掩得更严实了些，神殿那边也松了口。"},
+    {"cost": 130, "bond": 25, "intel": 0, "suspicion": -5,
+     "text": "你花钱、托关系，把被扣在别处的家人赎了出来——{ta}的忠诚，从今往后不用再装了。"},
+    {"cost": 25, "bond": 10, "intel": 0, "suspicion": 0,
+     "text": "你陪{ta}回了一趟旧主人的坟——没说太多话，但{ta}好像松快了些。"},
+    {"cost": 35, "bond": 9, "intel": 1, "suspicion": 0,
+     "text": "你没把这话当胡言乱语，反而认真问了问细节——{ta}第一次觉得，这份可怕的梦不必只能自己扛着。"},
+    {"cost": 85, "bond": 15, "intel": 0, "suspicion": 2,
+     "text": "你帮{ta}把这份身世藏得更深——伪造了一份来历，看不出破绽，但这种事，做得再好也难说绝对安全。"},
+]
+
 ITEM_NAME_POOL = ["一枚镶红宝石的胸针", "一柄象牙柄的匕首", "半卷褪色的古籍",
                    "一串来路不明的珍珠", "一尊小巧的银质神像", "一方带暗格的木盒"]
 
@@ -128,9 +153,9 @@ def _fill_pronouns(tpl, gender):
 # difficulty: 4-14；amount 类效果按周数在运行时缩放的不在这里做，事件效果是固定量级
 
 
-def _ev(id_, place, title, text, approaches):
+def _ev(id_, place, title, text, approaches, threat=False, bribe_cost=None):
     return {"id": id_, "place": place, "title": title, "text": text,
-            "approaches": approaches}
+            "approaches": approaches, "threat": threat, "bribe_cost": bribe_cost}
 
 
 EVENT_TEMPLATES = [
@@ -213,7 +238,7 @@ EVENT_TEMPLATES = [
             {"label": "动手教训", "attr": "might", "difficulty": 8,
              "success": {"bond_delta": 3},
              "failure": {"wound": True}},
-        ]),
+        ], threat=True, bribe_cost=45),
     _ev("ev_alley_smuggler", "暗巷", "走私者的暗号",
         "墙根下有人用你听不懂的暗语交谈，气氛不对，但情报可能就在这。",
         [
@@ -243,7 +268,7 @@ EVENT_TEMPLATES = [
             {"label": "抽身而退", "attr": "grit", "difficulty": 7,
              "success": {"suspicion_delta": 0},
              "failure": {"wound": True}},
-        ]),
+        ], threat=True, bribe_cost=90),
     _ev("ev_temple_confession", "神殿", "祭司的旁听",
         "祭司愿意为你占卜前程，代价是你要先坦白一件不光彩的事。",
         [
@@ -365,7 +390,7 @@ class ContentProvider:
     """内容供给的抽象接口。规则引擎只认这一层接口，不关心内容从哪来——
     这样以后接 LLMProvider / HybridProvider 时，规则引擎代码不需要改一行。"""
 
-    def draw_command(self, week, total_weeks, r):
+    def draw_command(self, week, total_weeks, r, suspicion=0):
         raise NotImplementedError
 
     def draw_board(self, week, used_ids, count, r):
@@ -378,13 +403,15 @@ class ContentProvider:
 class StaticPoolProvider(ContentProvider):
     """MVP 内容供给：从本文件内置的静态内容池里抽取/组装，不依赖任何外部 API。"""
 
-    def draw_command(self, week, total_weeks, r):
+    def draw_command(self, week, total_weeks, r, suspicion=0):
         ctype = r.choice(list(COMMAND_TYPES.keys()))
         spec = COMMAND_TYPES[ctype]
         title = r.choice(spec["titles"])
         progress = week / max(1, total_weeks)
+        # 猜疑越重，权力者越疑神疑鬼、越爱抓着你多要一点——命令的定价不只看周数
+        susp_factor = suspicion * 0.8
         if spec["kind"] == "resource":
-            amount = _clamp(int(60 + progress * 220 + r.randint(-15, 15)), 60, 280)
+            amount = _clamp(int(60 + progress * 220 + susp_factor + r.randint(-15, 15)), 60, 320)
             demand = spec["demand_tpl"].format(amount=amount)
             acceptance = {"kind": "resource", "resource": spec["resource"], "amount": amount}
         else:
@@ -395,7 +422,7 @@ class StaticPoolProvider(ContentProvider):
             demand = spec["demand_tpl"].format(filter_desc=filter_desc)
             # 赎买价：约为同期资源命令的两倍，代价远高于正常献祭，
             # 但保证"手里没有对应标记"不再是结构性死局
-            ransom = _clamp(int((60 + progress * 220) * 2 + r.randint(-20, 20)), 120, 560)
+            ransom = _clamp(int((60 + progress * 220 + susp_factor) * 2 + r.randint(-20, 20)), 120, 640)
             acceptance = {"kind": "sacrifice", "filter": {"tag": tag}, "ransom": ransom}
         return {"week": week, "type": ctype, "title": title, "demand": demand,
                 "acceptance": acceptance}
@@ -425,7 +452,7 @@ class StaticPoolProvider(ContentProvider):
             "name": name, "gender": gender, "avatar": avatar, "attrs": attrs,
             "tags": [tag], "status": "healthy", "bond": r.randint(40, 60),
             "secret": _fill_pronouns(secret_tpl, gender), "secret_tpl": secret_tpl,
-            "secret_revealed": False, "epitaph": None,
+            "secret_revealed": False, "secret_resolved": False, "epitaph": None,
             "wound_idle_days": 0,
         }
 
@@ -468,6 +495,7 @@ def fresh_state(seed=None, weeks=5, provider="static"):
         "command": None,
         "chronicle": [],
         "talk_used_today": False,
+        "gift_used_today": [],
         "talk_counts": {},
         "conspiracy_unlocked": False,
         "conspiracy_step": 0,
@@ -506,7 +534,8 @@ def _provider(state):
 
 def _draw_command(state):
     r = _rng(state)
-    state["command"] = _provider(state).draw_command(state["week"], state["total_weeks"], r)
+    state["command"] = _provider(state).draw_command(
+        state["week"], state["total_weeks"], r, suspicion=state["suspicion"])
     _commit_rng(state, r)
 
 
@@ -646,6 +675,9 @@ def cmd_dispatch(state, board_idx, appr_idx, card_id):
     susp_d = eff.get("suspicion_delta", 0)
     if not ok and "suspicion_delta" not in eff:
         susp_d = r.randint(0, 8)
+    if ok and appr["difficulty"] <= 6:
+        # 赢得太轻松也是一种引人注目——纯靠"挑最稳的选项"不该是零代价的
+        susp_d += 1
     if susp_d:
         state["suspicion"] = _clamp(state["suspicion"] + susp_d, 0, 999)
     if eff.get("wound") and card["status"] == "healthy":
@@ -678,6 +710,9 @@ def cmd_dispatch(state, board_idx, appr_idx, card_id):
         _trigger_ending(state, "purged", "抄家")
         lines.append(ENDING_FLAVOR["purged"])
 
+    state["day_log"].append("%s→%s：%s%s" % (
+        card["name"], ev["title"], verb,
+        "" if ok else "（失手）"))
     return "\n".join(lines) + "\n" + _status_bar(state)
 
 
@@ -708,7 +743,104 @@ def cmd_talk(state, card_id):
         card["secret_revealed"] = True
         state["intel"] += 1
         lines.append("这是你们第 %d 次深谈，%s 终于说出了藏了很久的事：%s" % (n, card["name"], card["secret"]))
-        lines.append("（情报 +1）")
+        lines.append("（情报 +1，可用 resolve %s 尝试花钱化解这件事）" % card["id"])
+    state["day_log"].append("与%s夜谈（羁绊+4%s）" % (card["name"], "，秘密揭示" if n >= 3 and card["secret_revealed"] else ""))
+    return "\n".join(lines) + "\n" + _status_bar(state)
+
+
+HEAL_COST = 40
+GIFT_COST = 25
+GIFT_BOND = 6
+
+
+def cmd_heal(state, card_id):
+    if state["pending_judgment"]:
+        return "审判日事务未了结，先处理 pay / sacrifice / defy。"
+    card = _card_by_id(state, card_id)
+    if card is None:
+        return "没有这张牌。"
+    if card["status"] != "wounded":
+        return "%s 现在没有伤，用不着治。" % card["name"]
+    if state["gold"] < HEAL_COST:
+        return "请郎中要 %d 金（现有 %d）。" % (HEAL_COST, state["gold"])
+    state["gold"] -= HEAL_COST
+    card["status"] = "healthy"
+    card["wound_idle_days"] = 0
+    state["day_log"].append("花%d金为%s疗伤" % (HEAL_COST, card["name"]))
+    return ("你悄悄请了郎中来看%s的伤，一副猛药下去，人当场就精神了不少（花费 %d 金）。" %
+            (card["name"], HEAL_COST)) + "\n" + _status_bar(state)
+
+
+def cmd_gift(state, card_id):
+    if state["pending_judgment"]:
+        return "审判日事务未了结，先处理 pay / sacrifice / defy。"
+    card = _card_by_id(state, card_id)
+    if card is None:
+        return "没有这张牌。"
+    if card["status"] == "dead":
+        return "%s 已经不在了。" % card["name"]
+    if card["id"] in state["gift_used_today"]:
+        return "今天已经给 %s 送过东西了。" % card["name"]
+    if state["gold"] < GIFT_COST:
+        return "送礼要 %d 金（现有 %d）。" % (GIFT_COST, state["gold"])
+    state["gold"] -= GIFT_COST
+    card["bond"] = _clamp(card["bond"] + GIFT_BOND, 0, 100)
+    state["gift_used_today"].append(card["id"])
+    state["day_log"].append("送礼给%s（羁绊+%d）" % (card["name"], GIFT_BOND))
+    return ("你让人给 %s 送去一份不声张的礼物。羁绊 +%d（现在 %d，花费 %d 金）。" %
+            (card["name"], GIFT_BOND, card["bond"], GIFT_COST)) + "\n" + _status_bar(state)
+
+
+def cmd_bribe(state, board_idx):
+    if state["pending_judgment"]:
+        return "审判日事务未了结，先处理 pay / sacrifice / defy。"
+    ev = _find_board(state, board_idx)
+    if ev is None:
+        return "没有这个场所编号。"
+    if not ev.get("threat"):
+        return "这件事用不着花钱买通——它不是冲着你来的威胁。"
+    if ev["id"] in state["dispatched_today"]:
+        return "这件事今天已经处理过了。"
+    cost = ev["bribe_cost"]
+    if state["gold"] < cost:
+        return "买通需要 %d 金（现有 %d）。" % (cost, state["gold"])
+    state["gold"] -= cost
+    state["dispatched_today"].append(ev["id"])
+    state["used_event_ids"].append(ev["id"])
+    state["day_log"].append("花%d金买通「%s」" % (cost, ev["title"]))
+    return ("你花了 %d 金把这件事悄悄按下去了，没人受伤，也没掷一次骰子——「%s」。" %
+            (cost, ev["title"])) + "\n" + _status_bar(state)
+
+
+def cmd_resolve(state, card_id):
+    if state["pending_judgment"]:
+        return "审判日事务未了结，先处理 pay / sacrifice / defy。"
+    card = _card_by_id(state, card_id)
+    if card is None:
+        return "没有这张牌。"
+    if card["status"] == "dead":
+        return "%s 已经不在了，这件事再也没法回应。" % card["name"]
+    if not card["secret_revealed"]:
+        return "%s 还没跟你说过什么秘密，先 talk 多聊聊。" % card["name"]
+    if card.get("secret_resolved"):
+        return "这件事已经处理过了。"
+    idx = SECRET_POOL.index(card["secret_tpl"]) if card["secret_tpl"] in SECRET_POOL else None
+    if idx is None:
+        return "这个秘密没法用这种方式回应。"
+    res = SECRET_RESOLUTIONS[idx]
+    if state["gold"] < res["cost"]:
+        return "回应这件事要 %d 金（现有 %d）。" % (res["cost"], state["gold"])
+    state["gold"] -= res["cost"]
+    card["bond"] = _clamp(card["bond"] + res["bond"], 0, 100)
+    card["secret_resolved"] = True
+    text = _fill_pronouns(res["text"], card.get("gender", "男"))
+    lines = ["%s（花费 %d 金，%s 羁绊 +%d）" % (text, res["cost"], card["name"], res["bond"])]
+    if res.get("intel"):
+        state["intel"] += res["intel"]
+        lines.append("（情报 +%d）" % res["intel"])
+    if res.get("suspicion"):
+        state["suspicion"] = _clamp(state["suspicion"] + res["suspicion"], 0, 999)
+    state["day_log"].append("花%d金化解%s的秘密" % (res["cost"], card["name"]))
     return "\n".join(lines) + "\n" + _status_bar(state)
 
 
@@ -717,7 +849,10 @@ def cmd_endday(state):
         return "审判日事务未了结，先处理 pay / sacrifice / defy。"
     if state["game_over"]:
         return "本局已经结束了。"
-    lines = ["—— 第 %d 周 · 第 %d 天，夜幕落下 ——" % (state["week"], state["day"])]
+    header = "—— 第 %d 周 · 第 %d 天，夜幕落下 ——" % (state["week"], state["day"])
+    lines = [header]
+    if state["day_log"]:
+        lines.append("　" + "；".join(state["day_log"]))
     # 受伤自愈：连续两天没被派遣的负伤角色会自动痊愈
     for c in state["cards"]:
         if c["status"] == "wounded":
@@ -728,6 +863,8 @@ def cmd_endday(state):
                 lines.append("%s 的伤养好了。" % c["name"])
 
     state["talk_used_today"] = False
+    state["gift_used_today"] = []
+    state["day_log"] = []
     state["ap"] = state["ap_max"]
     state["day"] += 1
 
@@ -782,12 +919,16 @@ def cmd_pay(state):
             return "赎买需要 %d 金（现有 %d）。可以先变卖珍宝（sell），或 sacrifice / defy。" % (ransom, state["gold"])
         state["gold"] -= ransom
         state["suspicion"] = _clamp(state["suspicion"] + 8, 0, 999)
-        return _pass_judgment(state, "你捧出 %d 金，替下了那条命。权力者收下了钱——只是那道目光，在你脸上多停了一瞬。" % ransom)
+        note = "你捧出 %d 金，替下了那条命。权力者收下了钱——只是那道目光，在你脸上多停了一瞬。" % ransom
+        state["chronicle"].append("⚖️ 第%d周审判：%s" % (state["week"], note))
+        return _pass_judgment(state, note)
     res, amt = acc["resource"], acc["amount"]
     if state.get(res, 0) < amt:
         return "%s 不够（有 %d，需要 %d）。可以先变卖珍宝（sell），或 defy。" % (res, state.get(res, 0), amt)
     state[res] -= amt
-    return _pass_judgment(state, "上缴了 %d %s，权力者满意地点了点头。" % (amt, res))
+    note = "上缴了 %d %s，权力者满意地点了点头。" % (amt, res)
+    state["chronicle"].append("⚖️ 第%d周审判：%s" % (state["week"], note))
+    return _pass_judgment(state, note)
 
 
 def cmd_sacrifice(state, card_id):
@@ -806,7 +947,9 @@ def cmd_sacrifice(state, card_id):
     r = _rng(state)
     card["epitaph"] = _fill_pronouns(r.choice(EPITAPH_POOL), card.get("gender", "男"))
     _commit_rng(state, r)
-    return _pass_judgment(state, "%s 被献了出去。%s" % (card["name"], card["epitaph"]))
+    note = "%s 被献了出去。%s" % (card["name"], card["epitaph"])
+    state["chronicle"].append("⚖️ 第%d周审判：%s" % (state["week"], note))
+    return _pass_judgment(state, note)
 
 
 def cmd_defy(state):
@@ -815,6 +958,7 @@ def cmd_defy(state):
     # 密谋已成：说「不」的这一刻，就是动手的时刻
     if state["conspiracy_done"]:
         _trigger_ending(state, "regicide", "弑君")
+        state["chronicle"].append("⚖️ 第%d周审判：你说了「不」。%s" % (state["week"], ENDING_FLAVOR["regicide_defy"]))
         return "你说了「不」。%s\n%s" % (ENDING_FLAVOR["regicide_defy"], _status_bar(state))
     # 否则生死取决于猜疑值：越受猜忌，刀落得越快
     r = _rng(state)
@@ -823,14 +967,19 @@ def cmd_defy(state):
     death_chance = _clamp(55 + state["suspicion"], 5, 95)
     if roll <= death_chance:
         _trigger_ending(state, "processed", "抗命被处死")
+        state["chronicle"].append("⚖️ 第%d周审判：你选择了抗命。%s" % (state["week"], ENDING_FLAVOR["processed"]))
         return "你选择了抗命。%s\n%s" % (ENDING_FLAVOR["processed"], _status_bar(state))
     _trigger_ending(state, "exiled", "抗命·放逐")
+    state["chronicle"].append("⚖️ 第%d周审判：你选择了抗命。%s" % (state["week"], ENDING_FLAVOR["exiled"]))
     return "你选择了抗命。%s\n%s" % (ENDING_FLAVOR["exiled"], _status_bar(state))
 
 
 def _pass_judgment(state, note):
     lines = [note]
-    state["suspicion"] = _clamp(state["suspicion"] - 5, 0, 999)
+    # 猜疑不是纯粹靠"办事办得好"就能压下去的：受宠本身就招忌，
+    # 被动值随周数缓慢爬升，办好这周命令能抵掉一部分，但很难真正清零
+    passive_rise = 4 + state["week"]
+    state["suspicion"] = _clamp(state["suspicion"] + passive_rise - 5, 0, 999)
     state["pending_judgment"] = False
 
     if state["conspiracy_done"]:
@@ -931,7 +1080,8 @@ def render_board(state):
     lines = ["—— 今日场所 ——"]
     for i, ev in enumerate(state["board"]):
         done = "（已处理）" if ev["id"] in state["dispatched_today"] else ""
-        lines.append("[%d] %s ｜ %s %s" % (i, ev["place"], ev["title"], done))
+        threat_tag = "　⚠️可用 bribe %d 买通(%d金)" % (i, ev["bribe_cost"]) if ev.get("threat") and not done else ""
+        lines.append("[%d] %s ｜ %s %s%s" % (i, ev["place"], ev["title"], done, threat_tag))
     lines.append("用 approach <编号> 查看应对方式，preview/dispatch 需要指定卡牌。")
     return "\n".join(lines) + "\n" + _status_bar(state)
 
@@ -953,7 +1103,12 @@ def render_folio(state):
     for c in state["cards"]:
         st = {"healthy": "健康", "wounded": "负伤", "dead": "已故"}[c["status"]]
         secret = c["secret"] if c["secret_revealed"] else "（秘密未揭示）"
-        lines.append("%s %s [%s] 状态:%s 羁绊:%d 秘密:%s" % (c["avatar"], c["name"], c["id"], st, c["bond"], secret))
+        if c["secret_revealed"] and c.get("secret_resolved"):
+            secret += "（已化解）"
+        attrs = c["attrs"]
+        attr_str = "魅%d 武%d 智%d 坚%d" % (attrs["charm"], attrs["might"], attrs["wit"], attrs["grit"])
+        lines.append("%s %s [%s] 状态:%s 羁绊:%d 属性:%s" % (c["avatar"], c["name"], c["id"], st, c["bond"], attr_str))
+        lines.append("   秘密:%s" % secret)
         if c["status"] == "dead" and c["epitaph"]:
             lines.append("   墓志铭：%s" % c["epitaph"])
     if state["conspiracy_unlocked"]:
@@ -1016,7 +1171,11 @@ HELP_TEXT = """🏛 金丝笼 · 可用指令
   sacrifice <卡id>            审判日：献祭一张卡
   defy                       审判日：抗命（生死难料，权力者的猜疑说了算）
   sell <珍宝id>               变卖一件珍宝换金币
-  folio                      万物志（卡牌与秘密、弑君线进度）
+  heal <卡id>                花40金请郎中，立刻治好负伤（不占行动点）
+  gift <卡id>                花25金送礼，羁绊+6（每卡每天限1次，不占行动点）
+  bribe <编号>               花钱买通"威胁"类事件（板上标⚠️的），不用掷骰、不占行动点
+  resolve <卡id>             秘密揭示后，花钱回应这件事（一次性，代价与效果因秘密而异）
+  folio                      万物志（卡牌、属性、秘密与是否化解、弑君线进度）
   chronicle [n]              最近n天的纪事（默认10）
   ending                     查看结局详情（游戏结束后）
   export                     导出当前存档（base64）
@@ -1083,6 +1242,14 @@ def _dispatch_one(part):
         return cmd_defy(s)
     if op == "sell":
         return cmd_sell(s, tokens[1])
+    if op == "heal":
+        return cmd_heal(s, tokens[1])
+    if op == "gift":
+        return cmd_gift(s, tokens[1])
+    if op == "bribe":
+        return cmd_bribe(s, int(tokens[1]))
+    if op == "resolve":
+        return cmd_resolve(s, tokens[1])
     if op == "folio":
         return render_folio(s)
     if op == "chronicle":
