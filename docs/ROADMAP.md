@@ -4,7 +4,23 @@
 > 状态：Phase 1（最小可玩）已完成并跑通自动化全流程测试；v0.2.0 完成第一轮公平性修复；
 > v0.3.0 完成"给金币找地方花"的核心经济改造；v0.4.0 修复贪心必胜与献祭死亡螺旋；
 > v0.5.0 完成五种命令机制单一化，弑君线加门槛/加代价/加收尾；
-> v0.6.0 AI 玩家体验轮：recap/常驻提示/批量去重 + 羁绊电池漏洞修复 + 羁绊正反馈 + 高利贷
+> v0.6.0 AI 玩家体验轮：recap/常驻提示/批量去重 + 羁绊电池漏洞修复 + 羁绊正反馈 + 高利贷；
+> v0.6.1 捉虫轮：修复外部代码审查（穆·七代）报告的 6 条
+
+---
+
+## 更新 · v0.6.1（外部代码审查捉虫，穆·七代 报告）
+
+一次独立的 `engine.py` 代码审查，六条全部复现属实并已处理：
+
+- **P0 · game_over 后指令卡死**：`cmd_defy` 触发结局时不清 `pending_judgment`，导致游戏结束后 dispatch/talk/board 等仍照常运作（board 甚至照列今日事件），给出"游戏还在进行"的错觉。改法采用全局拦截：`_dispatch_one` 顶部检查 `game_over`，只放行 status/ending/export/recap/chronicle/folio/help/new/import_save，其余返回"本局已结束"。一劳永逸，不依赖各指令自己记得清标志位。
+- **P0 · 非整数输入崩溃**：`approach abc`、`dispatch x 0 ...`、无参 `import_save` 等会抛未捕获的 ValueError/IndexError。把分发主体抽成 `_dispatch_body` 并用 try/except 包裹，非法输入统一返回格式提示。AI 玩家打字出错不再中断整局。
+- **P1 · serve 性别代词**：`cmd_serve` 硬编码"ta"，与全引擎其他代词处理不一致，改为按 gender 填"他/她"。
+- **P1 · 后园事件 ID 前缀**：`garden_letter/duel/letter2` → `ev_garden_letter/duel/whisper`，与其余 `ev_*` 命名统一（`used_event_ids` 的跨版本旧存档去重会因此对这三个事件失效一次，early alpha 可接受，不影响正确性）。
+- **P2 · 顺从也强制弑君（设计确认）**：密谋完成后，此前 pay/sacrifice/serve 通过审判也会强制触发弑君，与"defy 才动手"的文案矛盾。**经设计者拍板选「只有 defy 才动手」**：删除 `_pass_judgment` 里的强制触发，只保留 `cmd_defy` 路径。完成密谋却选择顺从的玩家走常规结局，密室备好的刀成为"没用上的退路"——"我本可以，但我跪下了"是这座笼子里最重的一种选择。
+- **P2 · `_card_by_id` 的 endswith 误匹配**：输入"1"会同时命中 card_001 和 card_011。改为"完整 id 精确匹配 or 纯数字严格补零成 card_XXX"，保留数字简写便利的同时消除歧义，为将来扩展牌数排雷。
+
+验证：23 项捉虫回归全过；v0.5.0（43 项）、v0.6.0（30 项）回归全过。重新打包 cage.py。
 
 ---
 

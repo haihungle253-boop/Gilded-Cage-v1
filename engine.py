@@ -26,7 +26,7 @@ import base64
 import random as _pyrandom
 
 GAME_TITLE = "金丝笼"
-GAME_VERSION = "0.6.0"
+GAME_VERSION = "0.6.1"
 
 # ============================================================
 # 一、可复现随机数（Mulberry32，state 是单个 32bit 整数，方便存档）
@@ -300,7 +300,7 @@ EVENT_TEMPLATES = [
              "success": {"suspicion_delta": -1},
              "failure": {"gold": -10}},
         ]),
-    _ev("garden_letter", "后园", "藏在石缝里的信", "后园的石缝里塞着一张字条，字迹潦草，落款却没有。",
+    _ev("ev_garden_letter", "后园", "藏在石缝里的信", "后园的石缝里塞着一张字条，字迹潦草，落款却没有。",
         [
             {"label": "循迹追查", "attr": "wit", "difficulty": 10,
              "success": {"intel": 2},
@@ -309,7 +309,7 @@ EVENT_TEMPLATES = [
              "success": {"suspicion_delta": -2},
              "failure": {"gold": 0}},
         ]),
-    _ev("garden_duel", "后园", "一场私下的较量",
+    _ev("ev_garden_duel", "后园", "一场私下的较量",
         "另一位随从借着切磋的名义，其实是想探探你带来的人的底细。",
         [
             {"label": "全力应战", "attr": "might", "difficulty": 9,
@@ -319,7 +319,7 @@ EVENT_TEMPLATES = [
              "success": {"bond_delta": 2, "suspicion_delta": -1},
              "failure": {"bond_delta": -2}},
         ]),
-    _ev("garden_letter2", "后园", "深夜的低语",
+    _ev("ev_garden_whisper", "后园", "深夜的低语",
         "两个人影在花丛后压低声音说话，风把只言片语送到你耳边。",
         [
             {"label": "屏息细听", "attr": "wit", "difficulty": 10,
@@ -612,9 +612,17 @@ def _draw_board(state):
 
 
 def _card_by_id(state, cid):
+    # 完整 id 精确匹配
     for c in state["cards"]:
-        if c["id"] == cid or c["id"].endswith(cid):
+        if c["id"] == cid:
             return c
+    # 纯数字简写：1 / 01 / 001 -> card_001（严格补零，不再用 endswith，
+    # 免得输入 "1" 同时命中 card_001 和 card_011）
+    if cid.isdigit():
+        target = "card_%03d" % int(cid)
+        for c in state["cards"]:
+            if c["id"] == target:
+                return c
     return None
 
 
@@ -1156,7 +1164,8 @@ def cmd_serve(state, card_id):
         return "%s 已经在服侍了，选别人吧。" % card["name"]
     card["status"] = "serving"
     card["serving_days_left"] = SERVITUDE_DAYS
-    note = "你把 %s 送到了权力者身边——这一整周，ta都不会在你身边。" % card["name"]
+    pronoun = "他" if card.get("gender") == "男" else "她"
+    note = "你把 %s 送到了权力者身边——这一整周，%s都不会在你身边。" % (card["name"], pronoun)
     state["chronicle"].append("⚖️ 第%d周审判：%s" % (state["week"], note))
     return _pass_judgment(state, note)
 
@@ -1235,10 +1244,9 @@ def _pass_judgment(state, note):
     state["debt_new"] = 0
     state["borrowed_this_week"] = False
 
-    if state["conspiracy_done"]:
-        _trigger_ending(state, "regicide", "弑君")
-        lines.append(ENDING_FLAVOR["regicide"])
-        return "\n".join(lines) + "\n" + _status_bar(state)
+    # 注意：密谋完成后，顺从（pay/sacrifice/serve）不再强制弑君——
+    # 动手只发生在 defy 那一刻（见 cmd_defy）。备好的刀可以不用，
+    # "我本可以，但我跪下了"是这座笼子里最重的一种选择。
 
     if state["week"] >= state["total_weeks"]:
         alive = [c for c in state["cards"] if c["status"] != "dead"]
@@ -1556,13 +1564,27 @@ def cmd(command):
     return "\n".join(outputs)
 
 
+# 游戏结束后仍允许的只读/存档/重开类指令；其余一律拦截，
+# 免得 board/status 照常运作、给出"游戏还在进行"的错觉
+_ALLOWED_AFTER_OVER = ("status", "ending", "export", "recap", "chronicle",
+                       "folio", "help", "new", "import_save")
+
+
 def _dispatch_one(part):
-    global _STATE
     tokens = part.split()
     if not tokens:
         return ""
     op = tokens[0]
+    if _STATE is not None and _STATE.get("game_over") and op not in _ALLOWED_AFTER_OVER:
+        return "本局已结束。用 ending 看结局，recap/folio 回顾，或 new 开一局新的。"
+    try:
+        return _dispatch_body(op, tokens)
+    except (ValueError, IndexError):
+        return "指令格式不对，help 看看正确用法（比如 approach 0、dispatch 0 0 card_001）。"
 
+
+def _dispatch_body(op, tokens):
+    global _STATE
     if op == "help":
         return HELP_TEXT
     if op == "new":
